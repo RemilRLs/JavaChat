@@ -4,6 +4,8 @@ import java.io.PrintStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.ServerSocket;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Class to handle the chat service (server)
@@ -12,11 +14,13 @@ import java.net.ServerSocket;
 public class ServiceChat extends Thread {
     private BufferedReader input;
 
-    static final int NBUSERSMAX = 5;
+    static final int NBUSERSMAX = 3;
     static int nbUsers = 0; // Number of connected users.
     private static final String[] userNames = new String[NBUSERSMAX];
     public static PrintStream[] outputs = new PrintStream[NBUSERSMAX];
 
+
+    private static final Map<String, String> credentials = new HashMap<>();
     private int userIndex;
     private String userName;
 
@@ -71,6 +75,54 @@ public class ServiceChat extends Thread {
     }
 
     /**
+     * Function that handle the authentification of an user.
+     *
+     * @return true if the user is authenticated | false otherwise
+     */
+    private boolean authenticate() throws IOException {
+        PrintStream tempOutput = new PrintStream(socket.getOutputStream());
+        tempOutput.println("[+] - Enter your login: ");
+        String login = input.readLine();
+
+        tempOutput.println("[+] - Enter your password: ");
+        String password = input.readLine();
+
+        if (login == null || password == null || login.trim().isEmpty() || password.trim().isEmpty()) {
+            tempOutput.println("[X] - Invalid login or password.");
+            return false;
+        }
+
+        login = login.trim();
+        password = password.trim();
+
+        synchronized (ServiceChat.class) {
+            // I check if the user is already connected or not
+
+            for (String name : userNames) {
+                if(name != null && name.equalsIgnoreCase(login)) {
+                    tempOutput.println("[X] - This user is already connected, maybe you have been hacked");
+                    return false;
+                }
+            }
+
+            // Check if the user is in the database
+            if (credentials.containsKey(login)) {
+                if(!credentials.get(login).equals(password)) {
+                    tempOutput.println("[X] - Invalid password");
+                    return false;
+                }
+            } else {
+                credentials.put(login, password);
+                tempOutput.println("[+] - You have been registered with login : " + login);
+            }
+
+            userName = login; // Everything is fine
+        }
+
+        return true;
+    }
+
+    /**
      * Function to initialize the input and output streams
      *
      * @return true if initialization is successful | false otherwise
@@ -88,50 +140,45 @@ public class ServiceChat extends Thread {
             input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             PrintStream tempOutput = new PrintStream(socket.getOutputStream());
 
-            String chosenName = null;
-            while (true) {
-                tempOutput.println("[+] - Enter your name: ");
-                chosenName = input.readLine();
-                if (chosenName == null) {
-                    tempOutput.println("[-] - Invalid name. Try again.");
-                    continue;
+            int attempts = 0;
+            while(attempts < 3){
+                if (!authenticate()) {
+                    attempts++; // User failed to authenticate
+                } else {
+                    break;
                 }
+            }
 
-                chosenName = chosenName.trim();
-                if (chosenName.isEmpty()) {
-                    tempOutput.println("[-] - Name cannot be empty.");
-                    continue;
-                }
+            if(attempts >= 3) {
+                tempOutput.println("[-] - Too many attempts for authentification Try again later.");
+                socket.close();
+                return false;
+            }
 
-                synchronized (ServiceChat.class) {
-                    if (isNicknameAlreadyUsed(chosenName)) {
-                        tempOutput.println("[-] - Name already in use. Choose another.");
-                    } else {
-                        userIndex = -1;
-                        for (int i = 0; i < NBUSERSMAX; i++) {
-                            if (outputs[i] == null) {
-                                userIndex = i;
-                                break;
-                            }
-                        }
-                        if (userIndex == -1) {
-                            tempOutput.println("[-] - Server error. Try again later.");
-                            socket.close();
-                            return false;
-                        }
-
-                        userName = chosenName;
-                        outputs[userIndex] = tempOutput;
-                        userNames[userIndex] = userName;
-                        nbUsers++;
-
-                        tempOutput.println("[+] - Welcome " + userName + "!");
-                        broadcastMessage("\n[+] - " + userName + " joined the chat!");
-
-                        System.out.println("[+] - " + userName + " connected. Users: " + nbUsers);
-                        return true;
+            synchronized (ServiceChat.class) {
+                userIndex = -1;
+                for (int i = 0; i < NBUSERSMAX; i++) {
+                    if (outputs[i] == null) { // I try to find a `null` position
+                        userIndex = i;
+                        break;
                     }
                 }
+                if (userIndex == -1) {
+                    tempOutput.println("[X] - Server is full.");
+                    socket.close();
+                    return false;
+                }
+
+                outputs[userIndex] = tempOutput;
+                userNames[userIndex] = userName;
+                nbUsers++;
+
+                tempOutput.println("[+] - Welcome " + userName + "!");
+                broadcastMessage("\n[+] - " + userName + " joined the chat!");
+
+                System.out.println("[+] - " + userName + " connected. Users: " + nbUsers);
+                broadcastMessage("[+] - Number of users connected: " + nbUsers);
+                return true;
             }
         } catch (IOException e) {
             System.err.println("[X] - Error initializing streams: " + e.getMessage());
@@ -153,19 +200,124 @@ public class ServiceChat extends Thread {
         }
     }
 
+    private void listUsers(){
+        String list = "[+] - List of connected users: ";
+        for(int i = 0; i < NBUSERSMAX; i++){
+            if(userNames[i] != null){
+                list += userNames[i] + " ";
+            }
+        }
+        outputs[userIndex].println(list);
+    }
+
+    /**
+     * Send a message to a specific client
+     */
+    private void sendMessage(String message) {
+        //output.println(message);
+    }
+
+    private void parserCommand(String message, PrintStream output) {
+        message = message.trim();
+
+        if (!message.startsWith("/")) {
+            String fullMessage = "<" + userName + "> " + message;
+            broadcastMessage(fullMessage);
+            return;
+        }
+
+        String[] parts = message.split("\\s+", 2);
+
+
+        String command = parts[0];
+        String content = (parts.length > 1) ? parts[1] : "";
+
+        switch (command) {
+            case "/help" -> {
+                output.println("======================================");
+                output.println("             JavaChat by me           ");
+                output.println("======================================");
+                output.println("[+] - List of available commands:");
+                output.println("    /list - List all connected users");
+                output.println("    /msgAll <message> - Send message to everyone");
+                output.println("    /msgTo <username> <message> - Send a private message to a user (Something to hide ? :D)");
+                output.println("    /quit - To disconnect from the chat");
+                output.println("======================================");
+            }
+            case "/list" -> {
+                listUsers();
+
+            }
+            case "/quit" -> {
+                outputs[userIndex].println("Goodbye " + userName + "!");
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    System.err.println("[X] - Error closing socket: " + e.getMessage());
+                }
+            }
+            case "/msgAll" -> {
+                if (content.isEmpty()) {
+                    output.println("[X] - Usage: /msgAll <message>");
+                } else {
+                    String fullMessage = "<" + userName + "> " + content;
+                    System.out.println("[Chat] " + fullMessage);
+                    broadcastMessage(fullMessage);
+                }
+            }
+            case "/msgTo" -> {
+                if (content.isEmpty()) {
+                    output.println("[X] - Usage: /msgTo <username> <message>");
+                } else {
+                    String[] subParts = content.split("\\s+", 2);
+                    if (subParts.length < 2) {
+                        output.println("[X] - Usage: /msgTo <username> <message>");
+                    } else {
+                        String targetUser = subParts[0];
+                        String privateMessage = subParts[1];
+
+                        int targetIndex = findUserIndex(targetUser); // I get the user
+                        if (targetIndex == -1) {
+                            output.println("[X] - User '" + targetUser + "' not found");
+                        } else {
+
+                            outputs[targetIndex].println("[Private] <" + userName + "> " + privateMessage);
+                            output.println("[Private to " + targetUser + "] " + privateMessage);
+                        }
+                    }
+                }
+            }
+            default -> {
+                output.println("[X] - Unknown command: " + command);
+            }
+        }
+    }
+
+    private int findUserIndex(String name) {
+        for (int i = 0; i < NBUSERSMAX; i++) {
+            if (userNames[i] != null && userNames[i].equalsIgnoreCase(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+
     /**
      * Main loop to read messages from the client and broadcast them
      */
     private void mainLoop() {
         try {
+
             String message;
             PrintStream currentOutput = outputs[userIndex];
+            listUsers();
             currentOutput.print("[>] Enter message: ");
+
             while ((message = input.readLine()) != null) {
-                String fullMessage = "<" + userName + "> " + message;
-                System.out.println("[Chat] " + fullMessage);
-                broadcastMessage(fullMessage);
-                currentOutput.print("[>] Enter message: ");
+                parserCommand(message, currentOutput);
+
+                currentOutput.print("\n[>] Enter message: ");
             }
         } catch (IOException e) {
             System.err.println("[X] - Client " + userName + " disconnected: " + e.getMessage());
