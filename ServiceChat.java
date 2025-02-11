@@ -1,11 +1,12 @@
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.PrintStream;
-import java.io.IOException;
+import java.io.*;
 import java.net.Socket;
 import java.net.ServerSocket;
+import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
 import java.util.Map;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Base64;
 
 /**
  * Class to handle the chat service (server)
@@ -19,12 +20,17 @@ public class ServiceChat extends Thread {
     private static final String[] userNames = new String[NBUSERSMAX];
     public static PrintStream[] outputs = new PrintStream[NBUSERSMAX];
 
+    private int BLOCK_SIZE = 240;
+
+    private boolean isHeavyClient;
+    private static final Map<String, FileTransfer> transferInProgress = new HashMap<>();
 
     private static final Map<String, String> credentials = new HashMap<>();
     private int userIndex;
     private String userName;
 
-    private Socket socket; // Socket client
+    private Socket socket;
+
 
     /**
      * Constructor of the class
@@ -68,6 +74,26 @@ public class ServiceChat extends Thread {
             }
         }
     }
+
+    private void detectClientType() throws IOException {
+        PrintStream tempOutput = new PrintStream(socket.getOutputStream());
+        tempOutput.println("[+] - You are about to enter a chat. Press ENTER to continue...");
+
+        input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        String line = input.readLine(); // I wait until the client send me something
+
+        if (line.isEmpty() || line.length() < 20) { // I check if it a telnet or not
+            System.out.println("[+] - Client detected as LIGHT (Telnet)");
+            tempOutput.println("[+] - You are a Light CLIENT !");
+            isHeavyClient = false;
+        } else { // I have done that the Heavy client have to send me a message during is connexion.
+            System.out.println("[+] - Client detected as HEAVY (ClientChat)");
+            tempOutput.println("[+] - You are an Heavy CLIENT !");
+            isHeavyClient = true;
+        }
+    }
+
+
 
     private void sendClient(String message) throws IOException {
         PrintStream tempOutput = new PrintStream(socket.getOutputStream());
@@ -137,6 +163,9 @@ public class ServiceChat extends Thread {
                 }
             }
 
+            detectClientType();
+
+
             input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             PrintStream tempOutput = new PrintStream(socket.getOutputStream());
 
@@ -201,21 +230,15 @@ public class ServiceChat extends Thread {
     }
 
     private void listUsers(){
-        String list = "[+] - List of connected users: ";
+        StringBuilder list = new StringBuilder("\n[+] - List of connected users: ");
         for(int i = 0; i < NBUSERSMAX; i++){
             if(userNames[i] != null){
-                list += userNames[i] + " ";
+                list.append("\n[>] - ").append(userNames[i]);
             }
         }
         outputs[userIndex].println(list);
     }
 
-    /**
-     * Send a message to a specific client
-     */
-    private void sendMessage(String message) {
-        //output.println(message);
-    }
 
     private void parserCommand(String message, PrintStream output) {
         message = message.trim();
@@ -227,7 +250,6 @@ public class ServiceChat extends Thread {
         }
 
         String[] parts = message.split("\\s+", 2);
-
 
         String command = parts[0];
         String content = (parts.length > 1) ? parts[1] : "";
@@ -249,7 +271,7 @@ public class ServiceChat extends Thread {
 
             }
             case "/quit" -> {
-                outputs[userIndex].println("Goodbye " + userName + "!");
+                outputs[userIndex].println("[+] - Goodbye " + userName + "!");
                 try {
                     socket.close();
                 } catch (IOException e) {
@@ -278,20 +300,138 @@ public class ServiceChat extends Thread {
 
                         int targetIndex = findUserIndex(targetUser); // I get the user
                         if (targetIndex == -1) {
-                            output.println("[X] - User '" + targetUser + "' not found");
+                            output.println("\n[X] - User '" + targetUser + "' not found");
                         } else {
-
-                            outputs[targetIndex].println("[Private] <" + userName + "> " + privateMessage);
-                            output.println("[Private to " + targetUser + "] " + privateMessage);
+                            if(privateMessage.startsWith("/FILE|")) {
+                                System.out.println("[+] - File received from " + userName + " to " + targetUser);
+                                handleFileReception(privateMessage, targetUser, targetIndex);
+                            } else {
+                                outputs[targetIndex].println("[Private] <" + userName + "> " + privateMessage);
+                                output.println("[Private to " + targetUser + "] " + privateMessage);
+                            }
                         }
                     }
                 }
             }
+            case "/fileResponse" -> {
+                String[] tokens = content.split("\\s+");
+                if(tokens.length < 3) {
+                    output.println("[X] - Usage: /fileResponse <sender> <ACCEPT/REFUSE> <filename>"); // I check if the user want to get a file or not
+                } else {
+                    String sender = tokens[0];
+                    String response = tokens[1];
+                    String filename = tokens[2];
+                    handleFileResponse(sender, response, filename);
+                }
+            }
+            case "/sendFileTo" -> {
+                if(!isHeavyClient){
+                    output.println("[X] - You are not allowed to send file because you are a telnet client");
+                }
+            }
+
             default -> {
                 output.println("[X] - Unknown command: " + command);
             }
         }
     }
+
+    private void handleFileResponse(String sender, String response, String filename) {
+        int senderIndex = findUserIndex(sender);
+
+        if(senderIndex == -1) {
+            outputs[userIndex].println("[X] - User '" + sender + "' not found");
+            return;
+        }
+
+        FileTransfer fileT = transferInProgress.get(userName); // I have done an hashmap to store the file transfert in progress
+
+        if(fileT == null) {
+            outputs[userIndex].println("[X] - Nothing to transfert for this file " + filename);
+            return;
+        }
+
+        if(response.equalsIgnoreCase("ACCEPT")) {
+            outputs[senderIndex].println("[+] - " + userName + " accepted your file");
+            sendFileToClient(fileT.filePath, userIndex);
+        } else if(response.equalsIgnoreCase("REFUSE")) {
+            outputs[senderIndex].println("[X] - " + userName + " refused your file");
+            outputs[userIndex].println("[X] - You refused the file from " + sender);
+
+            // Maybe I will have to delete the file there I don't know yet
+        } else {
+            outputs[senderIndex].println("[X] - Invalid response: " + response);
+        }
+
+        transferInProgress.remove(sender); // I remove from the hash map the transfer because that was is done or have been refused
+    }
+
+    private void sendFileToClient(String filePath, int targetIndex) {
+        try {
+            File file = new File(filePath);
+            if (!file.exists()) {
+                outputs[targetIndex].println("[X] - Error: File not found on server.");
+                return;
+            }
+
+            // 1 - I encode the name of the file in Base64
+            String encodedFilename = Base64.getEncoder().encodeToString(file.getName().getBytes());
+
+            // 2 - I encode the content of the file in Base64
+            byte[] fileContent = Files.readAllBytes(Paths.get(filePath));
+            String encodedContent = Base64.getEncoder().encodeToString(fileContent);
+
+            // 3 - I create the payload "/FILE|name|content"
+            String message = userName + ">FILE|" + encodedFilename + "|" + encodedContent;
+
+            // 4 - I send the file to the target
+            outputs[targetIndex].println(message);
+            outputs[userIndex].println("[+] - File successfully sent to " + userNames[targetIndex]);
+
+        } catch (IOException e) {
+            outputs[targetIndex].println("[X] - Error receiving file: " + e.getMessage());
+            outputs[userIndex].println("[X] - Error sending file: " + e.getMessage());
+        }
+    }
+
+
+
+    private void handleFileReception(String fileMessage, String targetUser, int targetIndex) {
+        try {
+            // I'm going to store the file in the received_files directory
+            String[] fileParts = fileMessage.substring(6).split("\\|");
+
+            if (fileParts.length < 2) {
+                outputs[userIndex].println("[X] - Invalid file format received.");
+                return;
+            }
+
+            //  1- I extract the name and the content of the file (still in Base64)
+            String encodedFilename = fileParts[0];
+            String encodedContent = fileParts[1];
+
+            // 2 - Decode the filename and the content
+            String filename = new String(Base64.getDecoder().decode(encodedFilename));
+            byte[] fileContent = Base64.getDecoder().decode(encodedContent);
+
+            // 3 - I save the file temporarily
+            String filePath = "received_files/" + filename;
+            Files.createDirectories(Paths.get("received_files"));
+            Files.write(Paths.get(filePath), fileContent, StandardOpenOption.CREATE);
+
+            System.out.println("[+] - File have been upload");
+
+            transferInProgress.put(targetUser, new FileTransfer(userName, filename, filePath));
+
+            outputs[targetIndex].println("[+] - " + userName + " sent you a file: " + filename);
+            outputs[targetIndex].println("[?] - To download it type: /fileResponse " + userName + " ACCEPT " + filename);
+            outputs[targetIndex].println("[?] - To refuse it type: /fileResponse " + userName + " REFUSE " + filename);
+
+        } catch (Exception e) {
+            outputs[userIndex].println("[X] - Error receiving file: " + e.getMessage());
+        }
+    }
+
 
     private int findUserIndex(String name) {
         for (int i = 0; i < NBUSERSMAX; i++) {
@@ -312,12 +452,14 @@ public class ServiceChat extends Thread {
             String message;
             PrintStream currentOutput = outputs[userIndex];
             listUsers();
-            currentOutput.print("[>] Enter message: ");
+            currentOutput.println("[>] Enter message: ");
+            currentOutput.flush(); // I had to add this line because the message was not displyed durint the good timing
 
             while ((message = input.readLine()) != null) {
                 parserCommand(message, currentOutput);
 
-                currentOutput.print("\n[>] Enter message: ");
+                currentOutput.println("\n[>] Enter message: ");
+                currentOutput.flush();
             }
         } catch (IOException e) {
             System.err.println("[X] - Client " + userName + " disconnected: " + e.getMessage());
